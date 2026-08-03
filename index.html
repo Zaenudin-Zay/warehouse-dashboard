@@ -139,6 +139,11 @@
 <div id="toast"></div>
 
 <script>
+// ---------------- Supabase init (must be first) ----------------
+const SUPABASE_URL = 'https://qwgfclqgjphdsytzldqp.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF3Z2ZjbHFnanBoZHN5dHpsZHFwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU1OTUxNTMsImV4cCI6MjEwMTE3MTE1M30.NP7A-hybPD_5J3uh8pXRfiEG7bx5OMqdOdb0wzIb2bE';
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
 // ---------------- utilities ----------------
 const STORAGE_KEY = "gudang-sim-data-v6";
 
@@ -279,66 +284,89 @@ const state = {
 
 async function loadData() {
   try {
-    // Ambil data produk
-    const { data: products } = await supabase.from('products').select('*');
-    // Ambil data gudang
-    const { data: warehouses } = await supabase.from('warehouses').select('*');
-    // Ambil data sales
-    const { data: salesTeam } = await supabase.from('sales_team').select('*');
-    // Ambil data transaksi
-    const { data: transactions } = await supabase.from('transactions').select('*').order('created_at', { ascending: false });
+    // Load all base data in parallel
+    const [
+      { data: products,     error: errP },
+      { data: warehouses,   error: errW },
+      { data: salesTeam,    error: errS },
+      { data: transactions, error: errT },
+      { data: wStock,       error: errWS },
+      { data: sStock,       error: errSS },
+    ] = await Promise.all([
+      supabase.from('products').select('*'),
+      supabase.from('warehouses').select('*'),
+      supabase.from('sales_team').select('*'),
+      supabase.from('transactions').select('*').order('created_at', { ascending: false }),
+      supabase.from('warehouse_stock').select('*'),
+      supabase.from('sales_stock').select('*'),
+    ]);
 
-    if (products && warehouses) {
-      state.data = {
-        products: products || [],
-        warehouses: warehouses || [],
-        salesTeam: salesTeam || [],
-        transactions: transactions || [],
-        stock: {},
-        salesStock: {},
-        returItems: [],
-        users: [] // Jika user masih disimpan lokal / Supabase Auth
-      };
-      
-      // Load stok gudang
-      const { data: wStock } = await supabase.from('warehouse_stock').select('*');
-      warehouses.forEach(w => {
-        state.data.stock[w.id] = {};
-        products.forEach(p => state.data.stock[w.id][p.id] = 0);
-      });
-      (wStock || []).forEach(s => {
-        if (state.data.stock[s.warehouse_id]) {
-          state.data.stock[s.warehouse_id][s.product_id] = s.qty;
-        }
-      });
-
-      render();
+    if (errP || errW) {
+      const msg = (errP || errW).message;
+      console.error("Gagal memuat data dari Supabase:", msg);
+      document.getElementById("root").innerHTML =
+        '<div style="padding:60px;text-align:center;color:#e11d48">Gagal memuat data: ' + msg + '</div>';
       return;
     }
+
+    const prods = products || [];
+    const whs   = warehouses || [];
+    const sales = salesTeam || [];
+
+    state.data = {
+      products:     prods,
+      warehouses:   whs,
+      salesTeam:    sales,
+      transactions: transactions || [],
+      stock:        {},
+      salesStock:   {},
+      returItems:   [],
+      users:        [],
+    };
+
+    // Build warehouse stock map
+    whs.forEach(w => {
+      state.data.stock[w.id] = {};
+      prods.forEach(p => { state.data.stock[w.id][p.id] = 0; });
+    });
+    (wStock || []).forEach(s => {
+      if (state.data.stock[s.warehouse_id]) {
+        state.data.stock[s.warehouse_id][s.product_id] = s.qty;
+      }
+    });
+
+    // Build sales stock map
+    sales.forEach(s => {
+      state.data.salesStock[s.id] = {};
+      prods.forEach(p => { state.data.salesStock[s.id][p.id] = 0; });
+    });
+    (sStock || []).forEach(s => {
+      if (state.data.salesStock[s.sales_id]) {
+        state.data.salesStock[s.sales_id][s.product_id] = s.qty;
+      }
+    });
+
+    render();
   } catch (e) {
     console.error("Gagal memuat data dari Supabase:", e);
+    document.getElementById("root").innerHTML =
+      '<div style="padding:60px;text-align:center;color:#e11d48">Gagal memuat data: ' + e.message + '</div>';
   }
-
-  // Fallback ke data seed jika database masih kosong
-  const seed = buildSeed();
-  state.data = seed;
-  render();
 }
 
 async function restoreSession() {
   try {
-    const res = await window.storage.get(SESSION_KEY, false);
-    if (res && res.value) {
-      const userId = res.value;
-      const user = state.data.users.find(u => u.id === userId);
-      if (user) state.session = user;
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session) {
+      await applySupabaseSession(session.user);
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error("Gagal restore session:", e);
+  }
 }
 
-async function persist() {
-  try { await window.storage.set(STORAGE_KEY, JSON.stringify(state.data), false); } catch (e) { console.error("gagal menyimpan", e); }
-}
+// persist() is a no-op — all writes go directly to Supabase
+function persist() {}
 
 function clone(o) { return JSON.parse(JSON.stringify(o)); }
 
@@ -373,69 +401,119 @@ async function pushTransaction(base) {
 }
 
 // ---------------- mutations ----------------
-function stockIn(warehouseId, productId, qty, note) {
+async function stockIn(warehouseId, productId, qty, note) {
   if (!warehouseId || !productId || !qty || qty <= 0) return notify("Lengkapi gudang, produk dan jumlah", "error");
+  const { error } = await supabase.rpc('update_warehouse_stock', {
+    p_warehouse_id: warehouseId,
+    p_product_id:   productId,
+    p_qty_delta:    qty,
+  });
+  if (error) return notify(error.message, "error");
   state.data.stock[warehouseId][productId] = (state.data.stock[warehouseId][productId] || 0) + qty;
-  pushTransaction({ type: "masuk", to: warehouseId, productId, qty, note: note || "Barang masuk dari principal" });
-  persist(); render();
+  await pushTransaction({ type: "masuk", to: warehouseId, productId, qty, note: note || "Barang masuk dari principal" });
+  render();
   notify("Barang masuk berhasil dicatat");
 }
 
-function transferWarehouse(fromId, toId, productId, qty) {
+async function transferWarehouse(fromId, toId, productId, qty) {
   if (!fromId || !toId || fromId === toId || !productId || !qty || qty <= 0) return notify("Lengkapi asal, tujuan, produk dan jumlah", "error");
   const avail = state.data.stock[fromId]?.[productId] || 0;
   if (qty > avail) return notify("Stok " + fromId + " tidak cukup (tersedia " + avail + ")", "error");
+  const { error } = await supabase.rpc('transfer_stock', {
+    p_from:       fromId,
+    p_to:         toId,
+    p_product_id: productId,
+    p_qty:        qty,
+    p_note:       "Perpindahan antar gudang",
+  });
+  if (error) return notify(error.message, "error");
   state.data.stock[fromId][productId] -= qty;
   state.data.stock[toId][productId] = (state.data.stock[toId][productId] || 0) + qty;
-  pushTransaction({ type: "transfer", from: fromId, to: toId, productId, qty, note: "Perpindahan antar gudang" });
-  persist(); render();
+  // The RPC already inserted the transaction; reload transactions from Supabase
+  const { data: txns } = await supabase.from('transactions').select('*').order('created_at', { ascending: false });
+  if (txns) state.data.transactions = txns;
+  render();
   notify("Perpindahan stok berhasil");
 }
 
-function distribusiToSales(warehouseId, salesId, productId, qty) {
+async function distribusiToSales(warehouseId, salesId, productId, qty) {
   if (!warehouseId || !salesId || !productId || !qty || qty <= 0) return notify("Lengkapi gudang asal, sales, produk dan jumlah", "error");
   const avail = state.data.stock[warehouseId]?.[productId] || 0;
   if (qty > avail) return notify("Stok gudang tidak cukup (tersedia " + avail + ")", "error");
+  const { error } = await supabase.rpc('distribute_to_sales', {
+    p_warehouse_id: warehouseId,
+    p_sales_id:     salesId,
+    p_product_id:   productId,
+    p_qty:          qty,
+    p_note:         "Distribusi ke tim sales",
+  });
+  if (error) return notify(error.message, "error");
   state.data.stock[warehouseId][productId] -= qty;
+  if (!state.data.salesStock[salesId]) state.data.salesStock[salesId] = {};
   state.data.salesStock[salesId][productId] = (state.data.salesStock[salesId][productId] || 0) + qty;
-  pushTransaction({ type: "distribusi", from: warehouseId, to: salesId, productId, qty, note: "Distribusi ke tim sales" });
-  persist(); render();
+  const { data: txns } = await supabase.from('transactions').select('*').order('created_at', { ascending: false });
+  if (txns) state.data.transactions = txns;
+  render();
   notify("Barang berhasil didistribusikan ke sales");
 }
 
-function addSalesPerson(id, name, gudangId, supervisor) {
+async function addSalesPerson(id, name, gudangId, supervisor) {
   id = (id || "").trim();
   name = (name || "").trim();
   if (!id || !name) return notify("ID Sales dan Nama Sales wajib diisi", "error");
   if (state.data.salesTeam.find(s => s.id.toLowerCase() === id.toLowerCase())) return notify("ID Sales \"" + id + "\" sudah dipakai", "error");
-  state.data.salesTeam.push({ id, name, gudang: gudangId || "", supervisor: (supervisor||"").trim() });
+  // Insert to Supabase
+  const { error: errTeam } = await supabase.from('sales_team').insert([{
+    id, name, gudang: gudangId || null, supervisor: (supervisor || "").trim() || null,
+  }]);
+  if (errTeam) return notify(errTeam.message, "error");
+  // Create sales_stock rows for all existing products
+  const stockRows = state.data.products.map(p => ({ sales_id: id, product_id: p.id, qty: 0 }));
+  if (stockRows.length) {
+    const { error: errStock } = await supabase.from('sales_stock').insert(stockRows);
+    if (errStock) console.error("sales_stock insert error:", errStock.message);
+  }
+  // Update local state
+  state.data.salesTeam.push({ id, name, gudang: gudangId || "", supervisor: (supervisor || "").trim() });
   state.data.salesStock[id] = {};
   state.data.products.forEach(p => state.data.salesStock[id][p.id] = 0);
   state.ui.salesSelectedStok = id;
-  persist(); render();
+  render();
   notify(name + " ditambahkan ke tim sales");
 }
 
-function deleteSalesPerson(id) {
+async function deleteSalesPerson(id) {
   const sales = state.data.salesTeam.find(s => s.id === id);
   if (!sales) return;
   const totalStock = Object.values(state.data.salesStock[id] || {}).reduce((a,b)=>a+b,0);
   if (totalStock > 0) return notify("Stok " + sales.name + " harus dikosongkan dulu sebelum bisa dihapus (sisa " + nfmt(totalStock) + " unit)", "error");
+  const { error } = await supabase.from('sales_team').delete().eq('id', id);
+  if (error) return notify(error.message, "error");
   state.data.salesTeam = state.data.salesTeam.filter(s => s.id !== id);
   delete state.data.salesStock[id];
   if (state.ui.salesSelectedStok === id) state.ui.salesSelectedStok = "";
-  persist(); render();
+  render();
   notify(sales.name + " berhasil dihapus dari tim sales");
 }
 
-function addCabang(name, kota) {
+async function addCabang(name, kota) {
   if (!name || !name.trim()) return;
   const id = uid("cabang");
+  const { error: errWh } = await supabase.from('warehouses').insert([{
+    id, name: name.trim(), type: 'cabang', kota: kota || '-',
+  }]);
+  if (errWh) return notify(errWh.message, "error");
+  // Create warehouse_stock rows for all existing products
+  const stockRows = state.data.products.map(p => ({ warehouse_id: id, product_id: p.id, qty: 0 }));
+  if (stockRows.length) {
+    const { error: errStock } = await supabase.from('warehouse_stock').insert(stockRows);
+    if (errStock) console.error("warehouse_stock insert error:", errStock.message);
+  }
   state.data.warehouses.push({ id, name: name.trim(), type: "cabang", kota: kota || "-" });
   state.data.stock[id] = {};
   state.data.products.forEach(p => state.data.stock[id][p.id] = 0);
   state.ui.cabangSelected = id;
-  persist(); render();
+  render();
   notify(name + " ditambahkan sebagai gudang cabang");
 }
 
@@ -462,53 +540,113 @@ function resolveReplacement(returId) {
   notify("Penggantian diterima, stok gudang pusat diperbarui");
 }
 
-function applySalesUpload() {
+async function applySalesUpload() {
   const rows = state.ui.uploadRows;
   let applied = 0;
-  rows.forEach(r => {
-    if (r.status !== "ok") return;
+  for (const r of rows) {
+    if (r.status !== "ok") continue;
+    // Decrement sales_stock in Supabase
+    const { data: ssRow } = await supabase
+      .from('sales_stock')
+      .select('qty')
+      .eq('sales_id', r.salesId)
+      .eq('product_id', r.productId)
+      .single();
+    if (ssRow) {
+      const newQty = (ssRow.qty || 0) - r.qty;
+      const { error } = await supabase.from('sales_stock')
+        .update({ qty: Math.max(0, newQty), updated_at: new Date().toISOString() })
+        .eq('sales_id', r.salesId)
+        .eq('product_id', r.productId);
+      if (error) { notify(error.message, "error"); continue; }
+    }
     state.data.salesStock[r.salesId][r.productId] -= r.qty;
-    pushTransaction({ type: "penjualan", from: r.salesId, productId: r.productId, qty: r.qty, note: "Upload data penjualan" });
+    await pushTransaction({ type: "penjualan", from: r.salesId, productId: r.productId, qty: r.qty, note: "Upload data penjualan" });
     applied++;
-  });
+  }
   state.ui.uploadRows = [];
   state.ui.uploadFileName = "";
-  persist(); render();
+  render();
   notify(applied + " baris penjualan berhasil diproses, stok sales dikurangi");
 }
 
-function applyCatalogImport() {
+async function applyCatalogImport() {
   const rows = state.ui.catalogRows.filter(r => r.status === "new" || r.status === "update");
   if (!rows.length) return;
   let added = 0, updated = 0;
 
+  // Prepare upsert payload
+  const productsToSave = rows.map(r => ({
+    id: r.id, name: r.name, brand: r.brand, category: r.category,
+    price: r.price, cluster: r.cluster, family_paket: r.familyPaket,
+    material_code: r.materialCode,
+  }));
+  const { error: errP } = await supabase.from('products').upsert(productsToSave, { onConflict: 'id' });
+  if (errP) return notify(errP.message, "error");
+
+  // Determine new vs updated
+  const newRows    = rows.filter(r => r.status === "new");
+  const updateRows = rows.filter(r => r.status === "update");
+  added   = newRows.length;
+  updated = updateRows.length;
+
+  // For new products: create warehouse_stock and sales_stock records
+  if (newRows.length) {
+    const whStockRows = [];
+    const sStockRows  = [];
+    state.data.warehouses.forEach(w => {
+      newRows.forEach(r => {
+        if (!(r.id in (state.data.stock[w.id] || {}))) {
+          whStockRows.push({ warehouse_id: w.id, product_id: r.id, qty: 0 });
+        }
+      });
+    });
+    state.data.salesTeam.forEach(s => {
+      newRows.forEach(r => {
+        if (!(r.id in (state.data.salesStock[s.id] || {}))) {
+          sStockRows.push({ sales_id: s.id, product_id: r.id, qty: 0 });
+        }
+      });
+    });
+    if (whStockRows.length) {
+      const { error: errWS } = await supabase.from('warehouse_stock').insert(whStockRows);
+      if (errWS) console.error("warehouse_stock insert error:", errWS.message);
+    }
+    if (sStockRows.length) {
+      const { error: errSS } = await supabase.from('sales_stock').insert(sStockRows);
+      if (errSS) console.error("sales_stock insert error:", errSS.message);
+    }
+  }
+
+  // Update local state
   rows.forEach(r => {
     const existing = state.data.products.find(p => p.id === r.id);
     if (existing) {
       existing.name = r.name; existing.brand = r.brand; existing.category = r.category;
       existing.price = r.price; existing.cluster = r.cluster; existing.familyPaket = r.familyPaket;
       existing.materialCode = r.materialCode;
-      updated++;
     } else {
       state.data.products.push({ id: r.id, name: r.name, brand: r.brand, category: r.category, price: r.price, cluster: r.cluster, familyPaket: r.familyPaket, materialCode: r.materialCode });
-      state.data.warehouses.forEach(w => { if (!(r.id in state.data.stock[w.id])) state.data.stock[w.id][r.id] = 0; });
-      state.data.salesTeam.forEach(s => { if (!(r.id in state.data.salesStock[s.id])) state.data.salesStock[s.id][r.id] = 0; });
-      added++;
+      state.data.warehouses.forEach(w => { if (!(r.id in (state.data.stock[w.id] || {}))) { if (!state.data.stock[w.id]) state.data.stock[w.id] = {}; state.data.stock[w.id][r.id] = 0; } });
+      state.data.salesTeam.forEach(s => { if (!(r.id in (state.data.salesStock[s.id] || {}))) { if (!state.data.salesStock[s.id]) state.data.salesStock[s.id] = {}; state.data.salesStock[s.id][r.id] = 0; } });
     }
   });
 
-  // nama Gudang Pusat mengikuti Sales Cluster dari data yang diupload
+  // Rename Gudang Pusat if cluster changed
   const importedCluster = (rows.find(r => r.cluster) || {}).cluster;
   let renamed = false;
   if (importedCluster) {
     const pusat = state.data.warehouses.find(w => w.id === "pusat");
     const newName = "Gudang Pusat - " + importedCluster;
-    if (pusat && pusat.name !== newName) { pusat.name = newName; pusat.kota = importedCluster; renamed = true; }
+    if (pusat && pusat.name !== newName) {
+      pusat.name = newName; pusat.kota = importedCluster; renamed = true;
+      await supabase.from('warehouses').update({ name: newName, kota: importedCluster }).eq('id', 'pusat');
+    }
   }
 
   state.ui.catalogRows = [];
   state.ui.catalogFileName = "";
-  persist(); render();
+  render();
   notify(added + " produk baru ditambahkan, " + updated + " produk diperbarui" + (renamed ? ", nama Gudang Pusat diperbarui ke \"" + importedCluster + "\"" : ""));
 }
 
@@ -586,15 +724,25 @@ function handleStockImportFile(input) {
     reader.readAsArrayBuffer(file);
   }
 }
-function applyStockImport() {
+async function applyStockImport() {
   const rows = state.ui.stockImportRows.filter(r => r.status === "ok");
-  rows.forEach(r => {
+  if (!rows.length) return;
+  // Upsert to Supabase
+  const upsertRows = rows.map(r => ({
+    warehouse_id: r.warehouseId,
+    product_id:   r.productId,
+    qty:          r.qty,
+  }));
+  const { error } = await supabase.from('warehouse_stock').upsert(upsertRows, { onConflict: 'warehouse_id,product_id' });
+  if (error) return notify(error.message, "error");
+  // Update local state and push transactions
+  for (const r of rows) {
     state.data.stock[r.warehouseId][r.productId] = r.qty;
-    pushTransaction({ type: "stok_awal", to: r.warehouseId, productId: r.productId, qty: r.qty, note: "Update stok awal via import (" + r.warehouseName + ")" });
-  });
+    await pushTransaction({ type: "stok_awal", to: r.warehouseId, productId: r.productId, qty: r.qty, note: "Update stok awal via import (" + r.warehouseName + ")" });
+  }
   state.ui.stockImportRows = [];
   state.ui.stockImportFileName = "";
-  persist(); render();
+  render();
   notify(rows.length + " baris stok awal berhasil diterapkan");
 }
 
@@ -654,25 +802,36 @@ function handleSalesImportFile(input) {
     reader.readAsArrayBuffer(file);
   }
 }
-function applySalesImport() {
+async function applySalesImport() {
   const rows = state.ui.salesImportRows.filter(r => r.status === "new" || r.status === "update");
   let added = 0, updated = 0;
-  rows.forEach(r => {
+  for (const r of rows) {
     const existing = state.data.salesTeam.find(s => s.id.toLowerCase() === r.id.toLowerCase());
     if (existing) {
+      const { error } = await supabase.from('sales_team').update({
+        name: r.name, gudang: r.gudang || null, supervisor: r.supervisor || null,
+      }).eq('id', r.id);
+      if (error) { notify(error.message, "error"); continue; }
       existing.name = r.name; existing.gudang = r.gudang; existing.supervisor = r.supervisor;
       updated++;
     } else {
+      const { error } = await supabase.from('sales_team').insert([{
+        id: r.id, name: r.name, gudang: r.gudang || null, supervisor: r.supervisor || null,
+      }]);
+      if (error) { notify(error.message, "error"); continue; }
+      // Create sales_stock rows for all existing products
+      const stockRows = state.data.products.map(p => ({ sales_id: r.id, product_id: p.id, qty: 0 }));
+      if (stockRows.length) await supabase.from('sales_stock').insert(stockRows);
       state.data.salesTeam.push({ id: r.id, name: r.name, gudang: r.gudang, supervisor: r.supervisor });
       state.data.salesStock[r.id] = {};
       state.data.products.forEach(p => state.data.salesStock[r.id][p.id] = 0);
       added++;
     }
-  });
+  }
   state.ui.salesImportRows = [];
   state.ui.salesImportFileName = "";
   if (rows.length && !state.ui.salesSelectedStok) state.ui.salesSelectedStok = rows[0].id;
-  persist(); render();
+  render();
   notify(added + " sales baru ditambahkan, " + updated + " sales diperbarui");
 }
 
@@ -681,20 +840,49 @@ function isPusatAdmin() { return state.session && state.session.role === "admin_
 function isCabangAdmin() { return state.session && state.session.role === "admin_cabang"; }
 function myCabangId() { return state.session ? state.session.cabangId : ""; }
 
+// Helper: fetch user_profiles and populate state.session
+async function applySupabaseSession(user) {
+  const { data: profile, error } = await supabase
+    .from('user_profiles')
+    .select('*')
+    .eq('id', user.id)
+    .single();
+  if (error || !profile) {
+    console.error("Profil pengguna tidak ditemukan:", error);
+    state.session = null;
+    return;
+  }
+  state.session = {
+    id:       profile.id,
+    name:     profile.name,
+    role:     profile.role,
+    cabangId: profile.cabang_id,
+    email:    user.email,
+  };
+}
+
 async function doLogin() {
-  const username = (document.getElementById("login-username")||{}).value || "";
-  const password = (document.getElementById("login-password")||{}).value || "";
-  const user = state.data.users.find(u => u.username.toLowerCase() === username.trim().toLowerCase() && u.password === password);
-  if (!user) { state.ui.loginError = "Username atau password salah"; render(); return; }
-  state.session = user;
+  const email    = (document.getElementById("login-username") || {}).value || "";
+  const password = (document.getElementById("login-password") || {}).value || "";
+  if (!email || !password) {
+    state.ui.loginError = "Email dan password wajib diisi";
+    render();
+    return;
+  }
+  const { data, error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+  if (error || !data.user) {
+    state.ui.loginError = error ? error.message : "Login gagal";
+    render();
+    return;
+  }
+  await applySupabaseSession(data.user);
   state.ui.loginError = "";
   if (isCabangAdmin() && state.tab === "pusat") state.tab = "dashboard";
-  try { await window.storage.set(SESSION_KEY, user.id, false); } catch (e) {}
   render();
 }
 async function doLogout() {
+  await supabase.auth.signOut();
   state.session = null;
-  try { await window.storage.set(SESSION_KEY, "", false); } catch (e) {}
   render();
 }
 function addUser(username, password, name, role, cabangId) {
@@ -762,10 +950,10 @@ function transactionTable(rows, compact) {
   if (!rows.length) return '<p class="muted">Belum ada transaksi.</p>';
   let html = '<div class="tbl-scroll"><table class="tbl"><thead><tr><th>Tanggal</th><th>Jenis</th><th>Produk</th>' + (compact?"":'<th>Dari</th><th>Ke</th>') + '<th class="num">Qty</th></tr></thead><tbody>';
   rows.forEach(t => {
-    const prod = state.data.products.find(p=>p.id===t.productId);
+    const prod = state.data.products.find(p=>p.id===t.product_id);
     const type = TYPE_LABEL[t.type] || [t.type, "badge-masuk"];
-    html += '<tr><td>' + fmtDate(t.date) + '</td><td><span class="badge ' + type[1] + '">' + type[0] + '</span></td><td>' + esc(prod?prod.name:t.productId) + '</td>';
-    if (!compact) html += '<td class="muted">' + (t.from ? esc(labelForLocation(t.from)) : "-") + '</td><td class="muted">' + (t.to ? esc(labelForLocation(t.to)) : "-") + '</td>';
+    html += '<tr><td>' + fmtDate(t.created_at) + '</td><td><span class="badge ' + type[1] + '">' + type[0] + '</span></td><td>' + esc(prod?prod.name:t.product_id) + '</td>';
+    if (!compact) html += '<td class="muted">' + (t.from_loc ? esc(labelForLocation(t.from_loc)) : "-") + '</td><td class="muted">' + (t.to_loc ? esc(labelForLocation(t.to_loc)) : "-") + '</td>';
     html += '<td class="num">' + nfmt(t.qty) + '</td></tr>';
   });
   html += '</tbody></table></div>';
@@ -853,7 +1041,7 @@ function renderDashboard() {
   const pendingReplacement = state.data.returItems.filter(r=>r.status==="menunggu_penggantian");
   const pendingQty = pendingReplacement.reduce((a,r)=>a+r.qty,0);
 
-  const periodTx = state.data.transactions.filter(t => inPeriod(t.date));
+  const periodTx = state.data.transactions.filter(t => inPeriod(t.created_at));
   const masukPeriode = periodTx.filter(t=>t.type==="masuk").reduce((a,t)=>a+t.qty,0);
   const terjualPeriode = periodTx.filter(t=>t.type==="penjualan").reduce((a,t)=>a+t.qty,0);
 
@@ -862,8 +1050,8 @@ function renderDashboard() {
   const groupByMonth = spanDays !== null && spanDays > 31;
   const map = {};
   periodTx.forEach(t => {
-    const key = groupByMonth ? fmtMonthShort(t.date) : fmtDateShort(t.date);
-    if (!map[key]) map[key] = { name: key, masuk: 0, keluar: 0, _t: new Date(t.date).getTime() };
+    const key = groupByMonth ? fmtMonthShort(t.created_at) : fmtDateShort(t.created_at);
+    if (!map[key]) map[key] = { name: key, masuk: 0, keluar: 0, _t: new Date(t.created_at).getTime() };
     if (t.type==="masuk" || t.type==="penggantian_masuk") map[key].masuk += t.qty;
     if (t.type==="penjualan") map[key].keluar += t.qty;
   });
@@ -883,7 +1071,7 @@ function renderDashboard() {
   }));
 
   const sellTotals = {};
-  periodTx.filter(t=>t.type==="penjualan").forEach(t => { sellTotals[t.productId] = (sellTotals[t.productId]||0) + t.qty; });
+  periodTx.filter(t=>t.type==="penjualan").forEach(t => { sellTotals[t.product_id] = (sellTotals[t.product_id]||0) + t.qty; });
   const topSelling = Object.entries(sellTotals).map(([id,qty])=>({ name: state.data.products.find(p=>p.id===id)?.name || id, qty })).sort((a,b)=>b.qty-a.qty).slice(0,6);
 
   const pLabel = periodLabel();
@@ -1416,11 +1604,11 @@ function renderLogin() {
       '<p class="login-sub">Masuk untuk mengakses dashboard stok kartu &amp; voucher</p>' +
       (state.ui.loginError ? '<div class="login-error">' + esc(state.ui.loginError) + '</div>' : '') +
       '<div class="stack" style="gap:12px">' +
-        '<label class="field"><span>Username</span><input class="input" id="login-username" placeholder="username" onkeydown="if(event.key===\'Enter\')doLogin()"></label>' +
+        '<label class="field"><span>Email</span><input class="input" id="login-username" placeholder="email@contoh.com" onkeydown="if(event.key===\'Enter\')doLogin()"></label>' +
         '<label class="field"><span>Password</span><input class="input" type="password" id="login-password" placeholder="password" onkeydown="if(event.key===\'Enter\')doLogin()"></label>' +
         '<button class="btn btn-primary" style="justify-content:center" onclick="doLogin()">Masuk</button>' +
       '</div>' +
-      '<p class="login-hint">Demo: <code class="inline">admin.pusat</code> / <code class="inline">admin123</code> (akses penuh) &middot; <code class="inline">admin.cabang</code> / <code class="inline">admin123</code> (akses cabang)</p>' +
+      '<p class="login-hint">Gunakan email dan password akun Supabase Auth yang telah didaftarkan oleh administrator.</p>' +
     '</div>' +
   '</div>';
 }
@@ -1461,7 +1649,7 @@ function onAddUser() {
 }
 
 function renderRiwayat() {
-  const rows = state.data.transactions.filter(t => (!state.ui.riwayatFilter || t.type===state.ui.riwayatFilter) && inPeriod(t.date));
+  const rows = state.data.transactions.filter(t => (!state.ui.riwayatFilter || t.type===state.ui.riwayatFilter) && inPeriod(t.created_at));
   return '<div class="stack">' +
     renderPeriodFilter() +
     '<div class="section"><div class="section-head"><h3>Riwayat transaksi &middot; ' + esc(periodLabel()) + ' (' + rows.length + ')</h3>' +
@@ -1577,17 +1765,20 @@ function render() {
   await loadData();
   await restoreSession();
   render();
+
+  // Keep session in sync with Supabase Auth state changes
+  supabase.auth.onAuthStateChange(async (event, session) => {
+    if (event === 'SIGNED_IN' && session) {
+      await applySupabaseSession(session.user);
+      render();
+    } else if (event === 'SIGNED_OUT') {
+      state.session = null;
+      render();
+    }
+  });
 })();
 </script>
 
-<script>
-const SUPABASE_URL = 'https://qwgfclqgjphdsytzldqp.supabase.co/rest/v1/'
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF3Z2ZjbHFnanBoZHN5dHpsZHFwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU1OTUxNTMsImV4cCI6MjEwMTE3MTE1M30.NP7A-hybPD_5J3uh8pXRfiEG7bx5OMqdOdb0wzIb2bE'
 
-const supabase = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
-</script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="js/supabase.js"></script>
-<script src="js/dashboard.js"></script>
 </body>
 </html>
