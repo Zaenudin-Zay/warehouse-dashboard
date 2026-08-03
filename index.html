@@ -1582,13 +1582,10 @@ function render() {
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
 <script>
-const supabaseUrl = 'https://qwgfclqgjphdsytzldqp.supabase.co/rest/v1/'
-const supabaseKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF3Z2ZjbHFnanBoZHN5dHpsZHFwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU1OTUxNTMsImV4cCI6MjEwMTE3MTE1M30.NP7A-hybPD_5J3uh8pXRfiEG7bx5OMqdOdb0wzIb2bE'
+const SUPABASE_URL = 'https://qwgfclqgjphdsytzldqp.supabase.co/rest/v1/'
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InF3Z2ZjbHFnanBoZHN5dHpsZHFwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODU1OTUxNTMsImV4cCI6MjEwMTE3MTE1M30.NP7A-hybPD_5J3uh8pXRfiEG7bx5OMqdOdb0wzIb2bE'
 
-const supabase = window.supabase.createClient(
-  supabaseUrl,
-  supabaseKey
-)
+const supabase = window.supabase ? window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY) : null;
 </script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="js/supabase.js"></script>
