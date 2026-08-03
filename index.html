@@ -1,6 +1,8 @@
 <!DOCTYPE html>
 <html lang="id">
 <head>
+  <!-- Supabase JS Client -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Inventory Management</title>
@@ -277,20 +279,50 @@ const state = {
 
 async function loadData() {
   try {
-    const res = await window.storage.get(STORAGE_KEY, false);
-    if (res && res.value) {
-      state.data = JSON.parse(res.value);
-      if (!state.data.users || !state.data.users.length) {
-        const seed = buildSeed();
-        state.data.users = seed.users;
-        await persist();
-      }
+    // Ambil data produk
+    const { data: products } = await supabase.from('products').select('*');
+    // Ambil data gudang
+    const { data: warehouses } = await supabase.from('warehouses').select('*');
+    // Ambil data sales
+    const { data: salesTeam } = await supabase.from('sales_team').select('*');
+    // Ambil data transaksi
+    const { data: transactions } = await supabase.from('transactions').select('*').order('created_at', { ascending: false });
+
+    if (products && warehouses) {
+      state.data = {
+        products: products || [],
+        warehouses: warehouses || [],
+        salesTeam: salesTeam || [],
+        transactions: transactions || [],
+        stock: {},
+        salesStock: {},
+        returItems: [],
+        users: [] // Jika user masih disimpan lokal / Supabase Auth
+      };
+      
+      // Load stok gudang
+      const { data: wStock } = await supabase.from('warehouse_stock').select('*');
+      warehouses.forEach(w => {
+        state.data.stock[w.id] = {};
+        products.forEach(p => state.data.stock[w.id][p.id] = 0);
+      });
+      (wStock || []).forEach(s => {
+        if (state.data.stock[s.warehouse_id]) {
+          state.data.stock[s.warehouse_id][s.product_id] = s.qty;
+        }
+      });
+
+      render();
       return;
     }
-  } catch (e) {}
+  } catch (e) {
+    console.error("Gagal memuat data dari Supabase:", e);
+  }
+
+  // Fallback ke data seed jika database masih kosong
   const seed = buildSeed();
   state.data = seed;
-  try { await window.storage.set(STORAGE_KEY, JSON.stringify(seed), false); } catch (e) {}
+  render();
 }
 
 async function restoreSession() {
@@ -320,8 +352,24 @@ function notify(msg, kind) {
   toastTimer = setTimeout(() => { el.style.display = "none"; }, 3200);
 }
 
-function pushTransaction(base) {
-  state.data.transactions.unshift({ id: uid("trx"), date: new Date().toISOString(), ...base });
+async function pushTransaction(base) {
+  const newTrx = { 
+    id: uid("trx"), 
+    created_at: new Date().toISOString(), 
+    type: base.type,
+    from_loc: base.from || null,
+    to_loc: base.to || null,
+    product_id: base.productId,
+    qty: base.qty,
+    note: base.note || "" 
+  };
+  
+  // Simpan ke state lokal
+  state.data.transactions.unshift(newTrx);
+
+  // Simpan ke Supabase
+  const { error } = await supabase.from('transactions').insert([newTrx]);
+  if (error) console.error("Gagal simpan transaksi ke Supabase:", error);
 }
 
 // ---------------- mutations ----------------
